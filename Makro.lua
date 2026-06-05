@@ -53,15 +53,38 @@ playButton.TextSize = 16
 playButton.Parent = frame
 
 -- ==========================================
--- HOOKING & PEREKAMAN (SISTEM INDEX ANTREAN)
+-- TRACKING URUTAN TOWER BERDASARKAN POSISI
 -- ==========================================
-local recordedTowersOrder = {} 
+local recordedTowerPositions = {} -- Menyimpan koordinat tempat naruh tower [index] = Vector3
 local recordPlaceCount = 0
 
-local function getTowerIndex(oldId)
-	for index, id in ipairs(recordedTowersOrder) do
-		if id == oldId then
-			return index
+-- Fungsi mencari tower terdekat berdasarkan posisi remote unit saat record
+local function findTowerIndexByClosestPosition(targetPos)
+	if not targetPos or type(targetPos) ~= "Vector3" then return nil end
+	local closestIndex = nil
+	local closestDistance = 6 -- Toleransi jarak klik (6 studs)
+	
+	for idx, pos in ipairs(recordedTowerPositions) do
+		local distance = (pos - targetPos).Magnitude
+		if distance < closestDistance then
+			closestDistance = distance
+			closestIndex = idx
+		end
+	end
+	return closestIndex
+end
+
+-- Fungsi pembantu untuk mencari koordinat object tower saat ini di Workspace
+local function getTowerPositionFromWorkspace(towerId)
+	for _, obj in pairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") then
+			local id = obj:GetAttribute("ID") or obj:GetAttribute("UUID") or (obj:FindFirstChild("ID") and obj.ID.Value) or obj.Name
+			if id == towerId then
+				local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+				if part then
+					return part.Position
+				end
+			end
 		end
 	end
 	return nil
@@ -79,6 +102,9 @@ local function logMacroAction(actionType, args)
 	print(string.format("[RECORDED] %s pada detik ke %.2f", actionType, elapsedTime))
 end
 
+-- ==========================================
+-- HOOKING REMOTES
+-- ==========================================
 local oldInvokeServer
 oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 	local args = {...}
@@ -87,25 +113,32 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 	if method == "InvokeServer" and isRecording then
 		if self == PlaceTower then
 			recordPlaceCount = recordPlaceCount + 1
-			local oldId = args[2]
-			recordedTowersOrder[recordPlaceCount] = oldId
+			local placePos = args[1]
+			recordedTowerPositions[recordPlaceCount] = placePos -- Kunci koordinat penempatan
 			
-			logMacroAction("Place", {args[1], oldId, args[3], recordPlaceCount})
+			logMacroAction("Place", {placePos, args[2], args[3], recordPlaceCount})
+			
 		elseif self == UpgradeTower then
-			local oldId = args[1]
-			local towerIdx = getTowerIndex(oldId)
-			logMacroAction("Upgrade", {oldId, towerIdx})
+			local targetId = args[1]
+			-- Cari posisi fisik tower yang diklik di workspace untuk tahu ini tower index keberapa
+			local currentPos = getTowerPositionFromWorkspace(targetId)
+			local towerIdx = findTowerIndexByClosestPosition(currentPos)
+			
+			logMacroAction("Upgrade", {targetId, towerIdx})
+			
 		elseif self == SellTower then
-			local oldId = args[1]
-			local towerIdx = getTowerIndex(oldId)
-			logMacroAction("Sell", {oldId, towerIdx})
+			local targetId = args[1]
+			local currentPos = getTowerPositionFromWorkspace(targetId)
+			local towerIdx = findTowerIndexByClosestPosition(currentPos)
+			
+			logMacroAction("Sell", {targetId, towerIdx})
 		end
 	end
 	
 	return oldInvokeServer(self, ...)
 end)
 
--- Fungsi pembantu untuk mencuri ID/UUID dari objek Model game
+-- Fungsi mengambil ID dari Model
 local function extractIdFromModel(model)
 	return model:GetAttribute("ID") 
 		or model:GetAttribute("UUID") 
@@ -115,9 +148,8 @@ local function extractIdFromModel(model)
 end
 
 -- ==========================================
--- PLAYBACK ENGINE (REAL-TIME LISTENER)
+-- PLAYBACK ENGINE
 -- ==========================================
-
 local function playMacro()
 	if #macroData == 0 then 
 		print("Data makro kosong!")
@@ -131,21 +163,15 @@ local function playMacro()
 	local currentIndex = 1
 	
 	local spawnedTowersNewIds = {} 
-	local currentPlacingIndex = 0 -- Melacak urutan tower keberapa yang sedang ditaruh saat PLAY
+	local currentPlacingIndex = 0 
 	
-	-- [KUNCI PERBAIKAN]: Otomatis mengintip Workspace / Map game. 
-	-- Begitu ada Model baru muncul, langsung ambil ID-nya dan masukkan ke urutan antrean!
+	-- Menangkap ID Tower baru yang muncul di game secara real-time
 	local mapConnection
 	mapConnection = workspace.DescendantAdded:Connect(function(descendant)
 		if not isPlaying then return end
-		
-		-- Pastikan yang muncul adalah Model dan bukan karakter player kita sendiri
 		if descendant:IsA("Model") and descendant.Parent ~= player.Character and descendant.Name ~= player.Name then
-			-- Tunggu 0.1 detik agar atribut/ID di dalam model tersebut selesai dimuat oleh server game
 			task.wait(0.1)
-			
 			local detectedId = extractIdFromModel(descendant)
-			-- Pastikan data ID yang ditarik bukan string kosong atau nama bawaan seperti "Model"
 			if detectedId and detectedId ~= "Model" and currentPlacingIndex > 0 then
 				if not spawnedTowersNewIds[currentPlacingIndex] then
 					spawnedTowersNewIds[currentPlacingIndex] = detectedId
@@ -178,7 +204,7 @@ local function playMacro()
 				local rotation = args[3]
 				local towerIndex = args[4]
 				
-				currentPlacingIndex = towerIndex -- Naikkan index antrean aktif
+				currentPlacingIndex = towerIndex 
 				
 				task.spawn(function()
 					print(string.format("[PLAY] Menaruh Tower #%d ke posisi...", towerIndex))
@@ -191,7 +217,6 @@ local function playMacro()
 				
 				task.spawn(function()
 					if towerIndex then
-						-- Menunggu maksimal 3 detik sampai objek tower lahir dan ID-nya tertangkap oleh Listener
 						local timeout = 0
 						while not spawnedTowersNewIds[towerIndex] and timeout < 3 do
 							task.wait(0.05)
@@ -206,7 +231,8 @@ local function playMacro()
 							print(string.format("[ERROR] Gagal Upgrade Tower #%d karena ID Baru tidak tertangkap.", towerIndex))
 						end
 					else
-						print("[ERROR] Tower Index tidak valid saat Upgrade!")
+						print("[ERROR] Indeks posisi tower tidak terdeteksi saat Record! Menggunakan ID Cadangan.")
+						UpgradeTower:InvokeServer(oldId)
 					end
 				end)
 				
@@ -216,7 +242,6 @@ local function playMacro()
 				
 				task.spawn(function()
 					if towerIndex then
-						-- Menunggu maksimal 3 detik sampai objek tower lahir dan ID-nya tertangkap oleh Listener
 						local timeout = 0
 						while not spawnedTowersNewIds[towerIndex] and timeout < 3 do
 							task.wait(0.05)
@@ -231,7 +256,8 @@ local function playMacro()
 							print(string.format("[ERROR] Gagal Sell Tower #%d karena ID Baru tidak tertangkap.", towerIndex))
 						end
 					else
-						print("[ERROR] Tower Index tidak valid saat Sell!")
+						print("[ERROR] Indeks posisi tower tidak terdeteksi saat Record! Menggunakan ID Cadangan.")
+						SellTower:InvokeServer(oldId)
 					end
 				end)
 			end
@@ -244,12 +270,11 @@ end
 -- ==========================================
 -- UI CONTROLLER
 -- ==========================================
-
 recordButton.MouseButton1Click:Connect(function()
 	if isPlaying then return end
 	if not isRecording then
 		macroData = {}
-		recordedTowersOrder = {}
+		recordedTowerPositions = {}
 		recordPlaceCount = 0
 		isRecording = true
 		startTime = tick()
