@@ -87,17 +87,19 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 end)
 
 -- ==========================================
--- BACKUP METHOD: MENCARI ID BERDASARKAN POSISI
+-- METODE SCANNING TOTAL (MENCARI ID BARU DI WORKSPACE)
 -- ==========================================
 local function findNewUnitIdByPosition(oldTargetPosition)
 	local closestModel = nil
-	local closestDistance = 5
+	local closestDistance = 6 -- Toleransi jarak 6 studs
 	
+	-- Kita cek semua object di Workspace
 	for _, obj in pairs(workspace:GetDescendants()) do
-		if obj:IsA("Model") then
-			local primary = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-			if primary then
-				local distance = (primary.Position - oldTargetPosition).Magnitude
+		if obj:IsA("Model") and obj.Parent ~= player.Character then
+			-- Coba cari BasePart di dalam model untuk dihitung posisinya
+			local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+			if part then
+				local distance = (part.Position - oldTargetPosition).Magnitude
 				if distance < closestDistance then
 					closestDistance = distance
 					closestModel = obj
@@ -107,17 +109,20 @@ local function findNewUnitIdByPosition(oldTargetPosition)
 	end
 	
 	if closestModel then
-		local detectedId = closestModel:GetAttribute("ID") 
+		-- Trik Terakhir: Ekstrak ID dari segala kemungkinan tempat penyimpanan di Roblox
+		local possibleId = closestModel:GetAttribute("ID") 
 			or closestModel:GetAttribute("UUID") 
 			or (closestModel:FindFirstChild("ID") and closestModel.ID.Value)
-			or closestModel.Name
-		return detectedId
+			or (closestModel:FindFirstChild("UUID") and closestModel.UUID.Value)
+			or closestModel.Name -- Jika nama modelnya adalah ID-nya
+			
+		return possibleId
 	end
 	return nil
 end
 
 -- ==========================================
--- PLAYBACK ENGINE (PEMUTAR MAKRO YANG DIPERBAIKI)
+-- PLAYBACK ENGINE
 -- ==========================================
 
 local function playMacro()
@@ -131,7 +136,7 @@ local function playMacro()
 	
 	local macroStartTime = tick()
 	local currentIndex = 1
-	local idMappingTable = {} -- Menghubungkan ID_Lama -> ID_Baru
+	local idMappingTable = {} 
 	
 	local connection
 	connection = RunService.Heartbeat:Connect(function()
@@ -156,21 +161,19 @@ local function playMacro()
 				
 				task.spawn(function()
 					print("[PLAY] Menyebarkan Tower ke posisi...", tostring(oldPosition))
-					local serverResponse = PlaceTower:InvokeServer(oldPosition, oldId, rotation)
+					PlaceTower:InvokeServer(oldPosition, oldId, rotation)
 					
-					if serverResponse and type(serverResponse) == "string" then
-						idMappingTable[oldId] = serverResponse
-						print("[SYSTEM] ID Baru terpetakan dari Server:", serverResponse)
+					-- Beri jeda 0.5 detik agar game selesai memunculkan model towernya di map
+					task.wait(0.5)
+					local foundId = findNewUnitIdByPosition(oldPosition)
+					
+					if foundId then
+						idMappingTable[oldId] = foundId
+						print("[SYSTEM] Berhasil Menangkap ID Baru dari Map:", foundId)
 					else
-						-- Tunggu sebentar sampai model tower benar-benar muncul di workspace
-						task.wait(0.3)
-						local foundId = findNewUnitIdByPosition(oldPosition)
-						if foundId then
-							idMappingTable[oldId] = foundId
-							print("[SYSTEM] ID Baru terpetakan dari Posisi:", foundId)
-						else
-							print("[WARN] Gagal mendeteksi ID baru di posisi:", tostring(oldPosition))
-						end
+						-- Jika scan gagal, pakai ID lama sebagai tebakan terakhir
+						idMappingTable[oldId] = oldId
+						print("[WARN] Gagal scan ID baru, terpaksa menggunakan ID Cadangan.")
 					end
 				end)
 				
@@ -178,42 +181,32 @@ local function playMacro()
 				local oldId = args[1]
 				
 				task.spawn(function()
-					-- PERBAIKAN: Tunggu hingga ID baru tersedia (maksimal menunggu 3 detik)
+					-- Menunggu sampai sistem "Place" selesai memetakan ID Baru (max 2 detik)
 					local timeout = 0
-					while not idMappingTable[oldId] and timeout < 3 do
-						task.wait(0.1)
-						timeout = timeout + 0.1
+					while not idMappingTable[oldId] and timeout < 2 do
+						task.wait(0.05)
+						timeout = timeout + 0.05
 					end
 					
-					local realId = idMappingTable[oldId]
-					if realId then
-						print("[PLAY] Mengupgrade Tower dengan ID:", realId)
-						UpgradeTower:InvokeServer(realId)
-					else
-						print("[ERROR] Batas waktu habis, memaksa Upgrade dengan ID Cadangan...")
-						UpgradeTower:InvokeServer(oldId)
-					end
+					local realId = idMappingTable[oldId] or oldId
+					print("[PLAY] Mengupgrade Tower dengan ID:", realId)
+					UpgradeTower:InvokeServer(realId)
 				end)
 				
 			elseif actionType == "Sell" then
 				local oldId = args[1]
 				
 				task.spawn(function()
-					-- PERBAIKAN: Tunggu hingga ID baru tersedia (maksimal menunggu 3 detik)
+					-- Menunggu sampai sistem "Place" selesai memetakan ID Baru (max 2 detik)
 					local timeout = 0
-					while not idMappingTable[oldId] and timeout < 3 do
-						task.wait(0.1)
-						timeout = timeout + 0.1
+					while not idMappingTable[oldId] and timeout < 2 do
+						task.wait(0.05)
+						timeout = timeout + 0.05
 					end
 					
-					local realId = idMappingTable[oldId]
-					if realId then
-						print("[PLAY] Menjual Tower dengan ID:", realId)
-						SellTower:InvokeServer(realId)
-					else
-						print("[ERROR] Batas waktu habis, memaksa Sell dengan ID Cadangan...")
-						SellTower:InvokeServer(oldId)
-					end
+					local realId = idMappingTable[oldId] or oldId
+					print("[PLAY] Menjual Tower dengan ID:", realId)
+					SellTower:InvokeServer(realId)
 				end)
 			end
 			
