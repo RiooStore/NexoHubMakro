@@ -53,7 +53,7 @@ playButton.TextSize = 16
 playButton.Parent = frame
 
 -- ==========================================
--- LOGIKA PEREKAMAN (URUTAN INDEX / QUEUE)
+-- HOOKING & PEREKAMAN
 -- ==========================================
 local recordedTowersOrder = {} 
 local recordPlaceCount = 0
@@ -88,8 +88,9 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 		if self == PlaceTower then
 			recordPlaceCount = recordPlaceCount + 1
 			local oldId = args[2]
-			recordedTowersOrder[recordPlaceCount] = oldId -- Catat urutan ID asli game saat perekaman
+			recordedTowersOrder[recordPlaceCount] = oldId
 			
+			-- Simpan posisi koordinat tower saat di-place
 			logMacroAction("Place", {args[1], oldId, args[3], recordPlaceCount})
 		elseif self == UpgradeTower then
 			local oldId = args[1]
@@ -105,17 +106,40 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 	return oldInvokeServer(self, ...)
 end)
 
--- Fungsi Pembantu Pembuat ID Acak Baru (Format UUID)
-local function generateFakeUUID()
-	local template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
-	return string.gsub(template, '[xy]', function (c)
-		local v = (c == 'x') and math.random(0, 15) or math.random(8, 11)
-		return string.format('%x', v)
-	end)
+-- ==========================================
+-- REAL-TIME SCANNER ID DI MAP
+-- ==========================================
+local function scanNewTowerIdAtPosition(targetPos)
+	local closestModel = nil
+	local closestDistance = 6 -- Toleransi jarak 6 studs sekitar area klik
+	
+	for _, obj in pairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") and obj.Parent ~= player.Character then
+			local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+			if part then
+				local distance = (part.Position - targetPos).Magnitude
+				if distance < closestDistance then
+					closestDistance = distance
+					closestModel = obj
+				end
+			end
+		end
+	end
+	
+	if closestModel then
+		-- Cari di segala penjuru properti model (Nama, Atribut, atau Value dalam model)
+		local detected = closestModel:GetAttribute("ID") 
+			or closestModel:GetAttribute("UUID") 
+			or (closestModel:FindFirstChild("ID") and closestModel.ID.Value)
+			or (closestModel:FindFirstChild("UUID") and closestModel.UUID.Value)
+			or closestModel.Name
+		return detected
+	end
+	return nil
 end
 
 -- ==========================================
--- PLAYBACK ENGINE (METODE INJEKSI ID CLIENT)
+-- PLAYBACK ENGINE
 -- ==========================================
 
 local function playMacro()
@@ -130,8 +154,8 @@ local function playMacro()
 	local macroStartTime = tick()
 	local currentIndex = 1
 	
-	-- Di sinilah kunci rahasianya: Menyimpan ID buatan kita sendiri berdasarkan urutan tower
-	local customGeneratedIds = {} 
+	-- Menampung ID Baru tower di sesi game sekarang berdasarkan urutan pembuatan
+	local spawnedTowersNewIds = {} 
 	
 	local connection
 	connection = RunService.Heartbeat:Connect(function()
@@ -151,29 +175,46 @@ local function playMacro()
 			
 			if actionType == "Place" then
 				local oldPosition = args[1]
+				local originalInventoryId = args[2] -- Menggunakan ID Asli bawaan game rekaman
 				local rotation = args[3]
-				local towerIndex = args[4] -- Nomor urutan pembuatan tower
-				
-				-- KITA BUAT ID BARU SENDIRI DI SINI!
-				local brandNewId = generateFakeUUID()
-				customGeneratedIds[towerIndex] = brandNewId
+				local towerIndex = args[4]
 				
 				task.spawn(function()
-					print(string.format("[PLAY] Menaruh Tower #%d dengan ID Buatan Sendiri: %s", towerIndex, brandNewId))
-					-- Kita paksa kirim ID buatan kita ke server game!
-					PlaceTower:InvokeServer(oldPosition, brandNewId, rotation)
+					print(string.format("[PLAY] Menaruh Tower #%d ke posisi...", towerIndex))
+					-- Jalankan remote bawaan game asli agar server tidak error 'Name' lagi
+					PlaceTower:InvokeServer(oldPosition, originalInventoryId, rotation)
+					
+					-- Tunggu 0.4 detik agar game selesai me-render model towernya di Workspace
+					task.wait(0.4)
+					local foundId = scanNewTowerIdAtPosition(oldPosition)
+					
+					if foundId then
+						spawnedTowersNewIds[towerIndex] = foundId
+						print(string.format("[SYSTEM] Tower #%d Berhasil discan! ID Baru: %s", towerIndex, foundId))
+					else
+						print(string.format("[WARN] Gagal mendeteksi ID Baru Tower #%d di map.", towerIndex))
+					end
 				end)
 				
 			elseif actionType == "Upgrade" then
-				local towerIndex = args[2] 
+				local towerIndex = args[2]
 				
 				task.spawn(function()
-					if towerIndex and customGeneratedIds[towerIndex] then
-						local realId = customGeneratedIds[towerIndex]
-						print(string.format("[PLAY] Mengupgrade Tower #%d menggunakan ID Sinkron: %s", towerIndex, realId))
-						UpgradeTower:InvokeServer(realId)
-					else
-						print("[ERROR] Urutan indeks tower bermasalah untuk Upgrade!")
+					if towerIndex then
+						-- MEMPERBAIKI DELAY SINKRONISASI: Menunggu hingga ID tower baru selesai discan
+						local timeout = 0
+						while not spawnedTowersNewIds[towerIndex] and timeout < 3 do
+							task.wait(0.05)
+							timeout = timeout + 0.05
+						end
+						
+						local realId = spawnedTowersNewIds[towerIndex]
+						if realId then
+							print(string.format("[PLAY] Mengupgrade Tower #%d dengan ID Baru: %s", towerIndex, realId))
+							UpgradeTower:InvokeServer(realId)
+						else
+							print(string.format("[ERROR] Gagal Upgrade Tower #%d karena ID tidak ditemukan setelah 3 detik.", towerIndex))
+						end
 					end
 				end)
 				
@@ -181,12 +222,21 @@ local function playMacro()
 				local towerIndex = args[2]
 				
 				task.spawn(function()
-					if towerIndex and customGeneratedIds[towerIndex] then
-						local realId = customGeneratedIds[towerIndex]
-						print(string.format("[PLAY] Menjual Tower #%d menggunakan ID Sinkron: %s", towerIndex, realId))
-						SellTower:InvokeServer(realId)
-					else
-						print("[ERROR] Urutan indeks tower bermasalah untuk Sell!")
+					if towerIndex then
+						-- MEMPERBAIKI DELAY SINKRONISASI: Menunggu hingga ID tower baru selesai discan
+						local timeout = 0
+						while not spawnedTowersNewIds[towerIndex] and timeout < 3 do
+							task.wait(0.05)
+							timeout = timeout + 0.05
+						end
+						
+						local realId = spawnedTowersNewIds[towerIndex]
+						if realId then
+							print(string.format("[PLAY] Menjual Tower #%d dengan ID Baru: %s", towerIndex, realId))
+							SellTower:InvokeServer(realId)
+						else
+							print(string.format("[ERROR] Gagal Sell Tower #%d karena ID tidak ditemukan setelah 3 detik.", towerIndex))
+						end
 					end
 				end)
 			end
