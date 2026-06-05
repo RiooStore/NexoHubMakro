@@ -53,8 +53,19 @@ playButton.TextSize = 16
 playButton.Parent = frame
 
 -- ==========================================
--- HOOKING REMOTES
+-- HOOKING & PEREKAMAN (URUTAN INDEX)
 -- ==========================================
+local recordedTowersOrder = {} -- Mencatat urutan ID lama pas record
+local recordPlaceCount = 0
+
+local function getTowerIndex(oldId)
+	for index, id in ipairs(recordedTowersOrder) do
+		if id == oldId then
+			return index
+		end
+	end
+	return nil
+end
 
 local function logMacroAction(actionType, args)
 	if not isRecording then return end
@@ -75,11 +86,19 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 	
 	if method == "InvokeServer" and isRecording then
 		if self == PlaceTower then
-			logMacroAction("Place", {args[1], args[2], args[3]})
+			recordPlaceCount = recordPlaceCount + 1
+			local oldId = args[2]
+			recordedTowersOrder[recordPlaceCount] = oldId -- Simpan urutan ID lamanya
+			
+			logMacroAction("Place", {args[1], oldId, args[3], recordPlaceCount})
 		elseif self == UpgradeTower then
-			logMacroAction("Upgrade", {args[1]})
+			local oldId = args[1]
+			local towerIdx = getTowerIndex(oldId)
+			logMacroAction("Upgrade", {oldId, towerIdx})
 		elseif self == SellTower then
-			logMacroAction("Sell", {args[1]})
+			local oldId = args[1]
+			local towerIdx = getTowerIndex(oldId)
+			logMacroAction("Sell", {oldId, towerIdx})
 		end
 	end
 	
@@ -87,19 +106,17 @@ oldInvokeServer = hookmetamethod(game, "__namecall", function(self, ...)
 end)
 
 -- ==========================================
--- METODE SCANNING TOTAL (MENCARI ID BARU DI WORKSPACE)
+-- BACKUP SCANNER (MENCARI ID BARU DI KOORDINAT)
 -- ==========================================
-local function findNewUnitIdByPosition(oldTargetPosition)
+local function scanNewTowerIdAtPosition(targetPos)
 	local closestModel = nil
-	local closestDistance = 6 -- Toleransi jarak 6 studs
+	local closestDistance = 5
 	
-	-- Kita cek semua object di Workspace
 	for _, obj in pairs(workspace:GetDescendants()) do
 		if obj:IsA("Model") and obj.Parent ~= player.Character then
-			-- Coba cari BasePart di dalam model untuk dihitung posisinya
 			local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
 			if part then
-				local distance = (part.Position - oldTargetPosition).Magnitude
+				local distance = (part.Position - targetPos).Magnitude
 				if distance < closestDistance then
 					closestDistance = distance
 					closestModel = obj
@@ -109,20 +126,16 @@ local function findNewUnitIdByPosition(oldTargetPosition)
 	end
 	
 	if closestModel then
-		-- Trik Terakhir: Ekstrak ID dari segala kemungkinan tempat penyimpanan di Roblox
-		local possibleId = closestModel:GetAttribute("ID") 
+		return closestModel:GetAttribute("ID") 
 			or closestModel:GetAttribute("UUID") 
 			or (closestModel:FindFirstChild("ID") and closestModel.ID.Value)
-			or (closestModel:FindFirstChild("UUID") and closestModel.UUID.Value)
-			or closestModel.Name -- Jika nama modelnya adalah ID-nya
-			
-		return possibleId
+			or closestModel.Name
 	end
 	return nil
 end
 
 -- ==========================================
--- PLAYBACK ENGINE
+-- PLAYBACK ENGINE (ANTI-MELESET)
 -- ==========================================
 
 local function playMacro()
@@ -136,7 +149,9 @@ local function playMacro()
 	
 	local macroStartTime = tick()
 	local currentIndex = 1
-	local idMappingTable = {} 
+	
+	-- Tabel penampung ID Baru berdasarkan urutan/index tower [index] = ID_Baru
+	local spawnedTowersNewIds = {} 
 	
 	local connection
 	connection = RunService.Heartbeat:Connect(function()
@@ -158,55 +173,73 @@ local function playMacro()
 				local oldPosition = args[1]
 				local oldId = args[2]
 				local rotation = args[3]
+				local towerIndex = args[4] -- Nomor urut tower ini (misal: Tower ke-1)
 				
 				task.spawn(function()
-					print("[PLAY] Menyebarkan Tower ke posisi...", tostring(oldPosition))
-					PlaceTower:InvokeServer(oldPosition, oldId, rotation)
+					print(string.format("[PLAY] Menaruh Tower #%d ke posisi...", towerIndex))
+					local serverResponse = PlaceTower:InvokeServer(oldPosition, oldId, rotation)
 					
-					-- Beri jeda 0.5 detik agar game selesai memunculkan model towernya di map
-					task.wait(0.5)
-					local foundId = findNewUnitIdByPosition(oldPosition)
-					
-					if foundId then
-						idMappingTable[oldId] = foundId
-						print("[SYSTEM] Berhasil Menangkap ID Baru dari Map:", foundId)
+					-- Coba ambil ID baru langsung dari respon server dulu
+					if serverResponse and type(serverResponse) == "string" then
+						spawnedTowersNewIds[towerIndex] = serverResponse
+						print(string.format("[SYSTEM] Tower #%d Terdaftar dengan ID: %s", towerIndex, serverResponse))
 					else
-						-- Jika scan gagal, pakai ID lama sebagai tebakan terakhir
-						idMappingTable[oldId] = oldId
-						print("[WARN] Gagal scan ID baru, terpaksa menggunakan ID Cadangan.")
+						-- Jika server tidak me-return ID, tunggu objek muncul lalu scan map
+						task.wait(0.4)
+						local foundId = scanNewTowerIdAtPosition(oldPosition)
+						if foundId then
+							spawnedTowersNewIds[towerIndex] = foundId
+							print(string.format("[SYSTEM] Tower #%d Terdaftar via Scan Map: %s", towerIndex, foundId))
+						else
+							-- Jika gagal total, gunakan ID lama sebagai fallback terpaksa
+							spawnedTowersNewIds[towerIndex] = oldId
+							print(string.format("[WARN] Gagal total scan ID Tower #%d. Menggunakan ID Cadangan.", towerIndex))
+						end
 					end
 				end)
 				
 			elseif actionType == "Upgrade" then
 				local oldId = args[1]
+				local towerIndex = args[2] -- Kita cari berdasarkan urutan nomor towernya, bukan string ID lamanya
 				
 				task.spawn(function()
-					-- Menunggu sampai sistem "Place" selesai memetakan ID Baru (max 2 detik)
-					local timeout = 0
-					while not idMappingTable[oldId] and timeout < 2 do
-						task.wait(0.05)
-						timeout = timeout + 0.05
+					if towerIndex then
+						-- Menunggu sampai Tower dengan urutan index tersebut selesai mendapatkan ID barunya
+						local timeout = 0
+						while not spawnedTowersNewIds[towerIndex] and timeout < 2.5 do
+							task.wait(0.05)
+							timeout = timeout + 0.05
+						end
+						
+						local realId = spawnedTowersNewIds[towerIndex] or oldId
+						print(string.format("[PLAY] Mengupgrade Tower #%d dengan ID Baru: %s", towerIndex, realId))
+						UpgradeTower:InvokeServer(realId)
+					else
+						print("[ERROR] Urutan indeks tower tidak valid, memaksa dengan ID lama.")
+						UpgradeTower:InvokeServer(oldId)
 					end
-					
-					local realId = idMappingTable[oldId] or oldId
-					print("[PLAY] Mengupgrade Tower dengan ID:", realId)
-					UpgradeTower:InvokeServer(realId)
 				end)
 				
 			elseif actionType == "Sell" then
 				local oldId = args[1]
+				local towerIndex = args[2]
 				
 				task.spawn(function()
-					-- Menunggu sampai sistem "Place" selesai memetakan ID Baru (max 2 detik)
-					local timeout = 0
-					while not idMappingTable[oldId] and timeout < 2 do
-						task.wait(0.05)
-						timeout = timeout + 0.05
+					if towerIndex then
+						-- Menunggu sampai Tower dengan urutan index tersebut selesai mendapatkan ID barunya
+						local timeout = 0
+						while not spawnedTowersNewIds[towerIndex] and timeout < 2.5 do
+							task.wait(0.05)
+							timeout = timeout + 0.05
+						end
+						
+						local realId = spawnedTowersNewIds[towerIndex] or oldId
+						print(string.format("[PLAY] Menjual Tower #%d dengan ID Baru: %s", towerIndex, realId))
+						SellTower:InvokeServer(realId)
+					else
+						print("[ERROR] Urutan indeks tower tidak valid, memaksa dengan ID lama.")
+						SellTower:InvokeServer(oldId)
 					end
-					
-					local realId = idMappingTable[oldId] or oldId
-					print("[PLAY] Menjual Tower dengan ID:", realId)
-					SellTower:InvokeServer(realId)
 				end)
 			end
 			
@@ -223,6 +256,8 @@ recordButton.MouseButton1Click:Connect(function()
 	if isPlaying then return end
 	if not isRecording then
 		macroData = {}
+		recordedTowersOrder = {}
+		recordPlaceCount = 0
 		isRecording = true
 		startTime = tick()
 		recordButton.BackgroundColor3 = Color3.fromRGB(255, 165, 0)
